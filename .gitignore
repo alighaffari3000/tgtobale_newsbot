@@ -1,0 +1,10 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+*.session
+*.session-journal
+*.log
+pending_media/
+__pycache__/
+graphify-out/

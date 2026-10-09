@@ -4,6 +4,7 @@ Listens to Telegram events, downloads media, sends to Bale, manages retries.
 """
 
 import asyncio
+import json
 import logging
 import tempfile
 from collections import defaultdict
@@ -39,6 +40,7 @@ IMMEDIATE_RETRY_DELAY = 60    # 1 minute before the one immediate retry
 MEDIA_STORE_DIR = "pending_media"  # persistent storage for pending message media
 BALE_CAPTION_LIMIT = 4096     # Bale max caption length
 BALE_MAX_MEDIA_BYTES = 20 * 1024 * 1024  # Bale 20 MB upload limit
+MAX_SEND_ATTEMPTS = 10       # give up (status='failed') after this many failed sends
 
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -74,6 +76,10 @@ class Forwarder:
                 self._username_cache[channel_id] = None
         return self._username_cache[channel_id]
 
+    def _is_blocked(self, text: Optional[str]) -> bool:
+        text = (text or "").lower()
+        return any(w in text for w in self.blocked_words)
+
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def register_handlers(self):
@@ -87,13 +93,11 @@ class Forwarder:
             if self.db.is_known(msg.id, channel_id):
                 return
 
-            # فیلتر کلمات مسدود
-            if self.blocked_words:
-                text_to_check = (msg.message or "").lower()
-                if any(w in text_to_check for w in self.blocked_words):
-                    logger.info("Post blocked (contains blocked word) from channel: %s (msg_id=%s)",
-                                channel_id, msg.id)
-                    return
+            # فیلتر کلمات مسدود — آلبوم‌ها بعد از جمع شدن کامل در _flush_media_group چک می‌شوند
+            if not msg.grouped_id and self._is_blocked(msg.message):
+                logger.info("Post blocked (contains blocked word) from channel: %s (msg_id=%s)",
+                            channel_id, msg.id)
+                return
 
             logger.info("New post detected from channel: %s (msg_id=%s)", channel_id, msg.id)
 
@@ -115,19 +119,34 @@ class Forwarder:
             if age > timedelta(minutes=EDIT_WATCH_MINUTES):
                 return
 
+            # آلبوم با شناسه اولین آیتمش ذخیره شده؛ ویرایش ممکن است روی هر آیتمی برسد
+            tg_id = msg.id
+            if msg.grouped_id:
+                # ponytail: ویرایش آیتم بدون متن نادیده گرفته می‌شود، پس حذف کامل کپشن آلبوم به بله نمی‌رسد
+                if not msg.message:
+                    return
+                album_row = self.db.get_row_by_grouped_id(msg.grouped_id, channel_id)
+                if album_row:  # rows from before the grouped_id migration fall back to msg.id
+                    tg_id = album_row["telegram_message_id"]
+
+            # ویرایشی که کلمه مسدود اضافه کرده: از بله حذف کن / از صف خارج کن
+            if self._is_blocked(msg.message):
+                await self._block_after_edit(tg_id, channel_id)
+                return
+
             new_text = _entities_to_markdown(msg.message, msg.entities) if msg.message is not None else None
             source = await self._get_channel_username(channel_id)
             date_str = _format_date(msg_date)
             new_caption = _build_footer(new_text, source, date_str)
 
             # Case 1: already sent to Bale → edit the Bale message
-            bale_msg_id = self.db.get_bale_message_id(msg.id, channel_id)
+            bale_msg_id = self.db.get_bale_message_id(tg_id, channel_id)
             if bale_msg_id:
                 if not new_caption:
                     return
 
                 tg_has_media = bool(msg.media and not isinstance(msg.media, MessageMediaWebPage))
-                db_row = self.db.get_row_by_telegram_id(msg.id, channel_id)
+                db_row = self.db.get_row_by_telegram_id(tg_id, channel_id)
                 db_media_type = db_row["media_type"] if db_row else None
 
                 # ── FIX: پست اول بدون عکس ارسال شده، بعد در تلگرام عکس اضافه شده ──
@@ -177,7 +196,7 @@ class Forwarder:
                     success = await asyncio.to_thread(self.bale.edit_message_text, bale_msg_id, new_caption)
 
                 if success:
-                    self.db.update_caption(msg.id, channel_id, new_caption)
+                    self.db.update_caption(tg_id, channel_id, new_caption)
                     logger.info("Bale message %s updated successfully", bale_msg_id)
                 else:
                     logger.warning("Failed to update Bale message %s", bale_msg_id)
@@ -185,10 +204,10 @@ class Forwarder:
 
             # Case 2: still pending (not yet sent) → update the stored caption so
             # the correct text is used when it eventually gets sent
-            if self.db.is_pending(msg.id, channel_id):
-                self.db.update_caption(msg.id, channel_id, new_caption or "")
+            if self.db.is_pending(tg_id, channel_id):
+                self.db.update_caption(tg_id, channel_id, new_caption or "")
                 logger.info("Pending post caption updated before send (msg_id=%s, channel=%s)",
-                            msg.id, channel_id)
+                            tg_id, channel_id)
 
     # ── Media group buffering ─────────────────────────────────────────────────
 
@@ -286,6 +305,11 @@ class Forwarder:
             except Exception as e:
                 logger.warning("Final re-fetch failed: %s", e)
 
+        if any(self._is_blocked(m.message) for m in messages):
+            logger.info("Media group blocked (contains blocked word) from channel: %s (group=%s)",
+                        channel_id, grouped_id)
+            return
+
         first_msg = messages[0]
         raw_caption = _extract_caption(messages)
         source = await self._get_channel_username(channel_id)
@@ -310,8 +334,8 @@ class Forwarder:
                     first_msg.id, reply_to_tg_id,
                 )
 
-        row_id = self.db.insert_message(first_msg.id, channel_id, caption, None, "photo",
-                                        reply_to_tg_id)
+        row_id = self.db.insert_message(first_msg.id, channel_id, caption, None, "album",
+                                        reply_to_tg_id, grouped_id)
         if row_id is None:
             return
 
@@ -415,10 +439,10 @@ class Forwarder:
                                 reply_to_bale_id: Optional[int] = None):
         media_items = []
         has_oversized = False
-        for msg in messages:
+        for i, msg in enumerate(messages):
             if not msg.media:
                 continue
-            item = await self._build_media_item(msg, caption=None)
+            item = await self._build_media_item(msg, row_id, i)
             if not item:
                 continue
             file_size = Path(item["path"]).stat().st_size if item.get("path") else 0
@@ -437,35 +461,39 @@ class Forwarder:
         if has_oversized:
             caption = _caption_with_oversize_note(caption, None)
 
-        bale_msg_id: Optional[int] = None
+        bale_ids: list[int] = []
         if media_items:
             # Pass caption separately; send_media_group places it on first item
-            bale_msg_id = await asyncio.to_thread(
+            bale_ids = await asyncio.to_thread(
                 self.bale.send_media_group, media_items, caption, reply_to_bale_id
             )
-            for item in media_items:
-                _safe_remove(item.get("path", ""))
 
-        if not bale_msg_id and caption:
-            bale_msg_id = await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id)
+        if not bale_ids and caption:
+            text_id = await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id)
+            bale_ids = [text_id] if text_id else []
 
+        bale_msg_id = bale_ids[0] if bale_ids else None
         if bale_msg_id:
-            self.db.mark_sent(row_id, bale_msg_id)
+            self.db.mark_sent(row_id, bale_msg_id, bale_ids)
+            for item in media_items:
+                _safe_remove(item["path"])
             logger.info("Post sent to Bale successfully (row_id=%s, media_group)", row_id)
             # Send overflow caption as a reply if needed
             await self._send_caption_overflow(caption, bale_msg_id)
         else:
+            # Keep downloaded files so retry loops can re-send the whole album
+            if media_items:
+                self.db.update_media(row_id, json.dumps(media_items), "album")
             self.db.mark_failed(row_id, 0)
             logger.warning("Failed to send post to Bale (row_id=%s), will retry", row_id)
 
     # ── Media helpers ─────────────────────────────────────────────────────────
 
-    async def _build_media_item(self, msg, caption: Optional[str]) -> Optional[dict]:
+    async def _build_media_item(self, msg, row_id: int, index: int) -> Optional[dict]:
         try:
-            suffix = _guess_suffix(msg)
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.close()
-            path = await self.tg.download_media(msg, file=tmp.name)
+            # Download to persistent dir so it survives retries
+            dest = Path(MEDIA_STORE_DIR) / f"row{row_id}_{index}{_guess_suffix(msg)}"
+            path = await self.tg.download_media(msg, file=str(dest))
             if not path:
                 return None
 
@@ -485,7 +513,7 @@ class Forwarder:
                 _safe_remove(path)
                 return None
 
-            return {"type": media_type, "path": path, "caption": caption}
+            return {"type": media_type, "path": path}
         except Exception as e:
             logger.error("Failed to download media for msg %s: %s", msg.id, e)
             return None
@@ -570,7 +598,21 @@ class Forwarder:
         if reply_to_tg_id:
             reply_to_bale_id = self.db.get_bale_message_id(reply_to_tg_id, row["channel_id"])
 
-        if media_path and media_type and Path(media_path).exists():
+        if media_type == "album" and media_path:
+            items = [i for i in json.loads(media_path) if Path(i["path"]).exists()]
+            if items:
+                sent_ids = await asyncio.to_thread(self.bale.send_media_group, items, caption,
+                                                   reply_to_bale_id)
+                if not sent_ids:
+                    return None
+                # store all album ids now; the caller's mark_sent(id) keeps them
+                self.db.mark_sent(row["id"], sent_ids[0], sent_ids)
+                for i in items:
+                    _safe_remove(i["path"])
+                return sent_ids[0]
+            # files gone — fall through to text
+
+        elif media_path and media_type and Path(media_path).exists():
             file_size = Path(media_path).stat().st_size
             if file_size > BALE_MAX_MEDIA_BYTES:
                 logger.warning(
@@ -595,6 +637,33 @@ class Forwarder:
             return await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id)
         return None
 
+    def _give_up_if_exhausted(self, row) -> bool:
+        """After MAX_SEND_ATTEMPTS failures, mark the row 'failed' and drop its media."""
+        if row["retry_count"] + 1 < MAX_SEND_ATTEMPTS:
+            return False
+        self.db.set_status(row["id"], "failed")
+        _remove_row_media(row)
+        logger.error("Giving up on row_id=%s after %d attempts", row["id"], MAX_SEND_ATTEMPTS)
+        return True
+
+    async def _block_after_edit(self, telegram_message_id: int, channel_id: str):
+        """An edit added a blocked word: delete the Bale copy, or drop it from the queue."""
+        row = self.db.get_row_by_telegram_id(telegram_message_id, channel_id)
+        if not row or row["status"] not in ("sent", "pending"):
+            return
+        if row["status"] == "sent" and row["bale_message_id"]:
+            ids = json.loads(row["bale_message_ids"] or "null") or [row["bale_message_id"]]
+            failed = [mid for mid in ids
+                      if not await asyncio.to_thread(self.bale.delete_message, mid)]
+            if failed:
+                # stays 'sent', so a later edit retries the delete
+                logger.warning("Could not delete Bale messages %s for blocked edit", failed)
+                return
+        _remove_row_media(row)
+        self.db.set_status(row["id"], "blocked")
+        logger.info("Post blocked after edit (msg_id=%s, channel=%s, was %s)",
+                    telegram_message_id, channel_id, row["status"])
+
     # ── Retry & connectivity loops ────────────────────────────────────────────
 
     async def immediate_retry_loop(self):
@@ -612,7 +681,7 @@ class Forwarder:
                     if sent_id:
                         self.db.mark_sent(row["id"], sent_id)
                         logger.info("Post sent to Bale successfully on retry (row_id=%s)", row["id"])
-                    else:
+                    elif not self._give_up_if_exhausted(row):
                         self.db.mark_failed(row["id"], row["retry_count"])
                         logger.warning("Retry failed for row_id=%s, moved to pending queue", row["id"])
             except Exception as e:
@@ -642,7 +711,7 @@ class Forwarder:
                     if sent_id:
                         self.db.mark_sent(row["id"], sent_id)
                         logger.info("Queued post sent to Bale (row_id=%s)", row["id"])
-                    else:
+                    elif not self._give_up_if_exhausted(row):
                         self.db.mark_failed(row["id"], row["retry_count"])
                         logger.warning("Failed to flush queued post (row_id=%s), keeping in queue", row["id"])
             except Exception as e:
@@ -888,6 +957,18 @@ def _safe_remove(path: str):
             Path(path).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _remove_row_media(row):
+    """Delete media files stored for a DB row (single path or album JSON)."""
+    media_path = row["media_paths"]
+    if not media_path:
+        return
+    if row["media_type"] == "album":
+        for item in json.loads(media_path):
+            _safe_remove(item["path"])
+    else:
+        _safe_remove(media_path)
 
 
 def _caption_with_oversize_note(caption: Optional[str], source: Optional[str]) -> str:

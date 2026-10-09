@@ -7,6 +7,7 @@ Retry logic:
   Connectivity loop flushes all queued messages in order once Bale is reachable again.
 """
 
+import json
 import sqlite3
 import logging
 from datetime import datetime, timezone
@@ -45,6 +46,8 @@ class Database:
                     bale_message_id         INTEGER,
                     reply_to_tg_message_id  INTEGER,
                     created_at              TEXT NOT NULL,
+                    grouped_id              INTEGER,
+                    bale_message_ids        TEXT,
                     UNIQUE(telegram_message_id, channel_id)
                 )
             """)
@@ -59,6 +62,12 @@ class Database:
             if "reply_to_tg_message_id" not in existing:
                 conn.execute("ALTER TABLE messages ADD COLUMN reply_to_tg_message_id INTEGER")
                 logger.info("DB migration: added reply_to_tg_message_id column")
+            if "grouped_id" not in existing:
+                conn.execute("ALTER TABLE messages ADD COLUMN grouped_id INTEGER")
+                logger.info("DB migration: added grouped_id column")
+            if "bale_message_ids" not in existing:
+                conn.execute("ALTER TABLE messages ADD COLUMN bale_message_ids TEXT")
+                logger.info("DB migration: added bale_message_ids column")
             conn.commit()
         logger.debug("Database initialized: %s", self.db_path)
 
@@ -70,6 +79,7 @@ class Database:
         media_paths: Optional[str],
         media_type: Optional[str] = None,
         reply_to_tg_message_id: Optional[int] = None,
+        grouped_id: Optional[int] = None,
     ) -> Optional[int]:
         """Insert a new pending message. Returns row id or None if duplicate."""
         try:
@@ -78,11 +88,11 @@ class Database:
                     """
                     INSERT OR IGNORE INTO messages
                         (telegram_message_id, channel_id, caption, media_paths, media_type,
-                         reply_to_tg_message_id, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                         reply_to_tg_message_id, grouped_id, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """,
                     (telegram_message_id, channel_id, caption, media_paths, media_type,
-                     reply_to_tg_message_id, _utcnow()),
+                     reply_to_tg_message_id, grouped_id, _utcnow()),
                 )
                 conn.commit()
                 return cur.lastrowid if cur.rowcount else None
@@ -90,11 +100,15 @@ class Database:
             logger.error("DB insert error: %s", e)
             return None
 
-    def mark_sent(self, row_id: int, bale_message_id: Optional[int] = None):
+    def mark_sent(self, row_id: int, bale_message_id: Optional[int] = None,
+                  bale_message_ids: Optional[list[int]] = None):
+        """bale_message_ids: every Bale message of an album (kept if not given)."""
         with self._connect() as conn:
             conn.execute(
-                "UPDATE messages SET status='sent', bale_message_id=? WHERE id=?",
-                (bale_message_id, row_id),
+                """UPDATE messages SET status='sent', bale_message_id=?,
+                       bale_message_ids=COALESCE(?, bale_message_ids) WHERE id=?""",
+                (bale_message_id, json.dumps(bale_message_ids) if bale_message_ids else None,
+                 row_id),
             )
             conn.commit()
 
@@ -108,6 +122,12 @@ class Database:
                 "UPDATE messages SET status='pending', retry_count=? WHERE id=?",
                 (retry_count + 1, row_id),
             )
+            conn.commit()
+
+    def set_status(self, row_id: int, status: str):
+        """Move a row to a terminal status: 'failed' (gave up) or 'blocked' (blocked word after edit)."""
+        with self._connect() as conn:
+            conn.execute("UPDATE messages SET status=? WHERE id=?", (status, row_id))
             conn.commit()
 
     def get_immediate_retries(self) -> list[sqlite3.Row]:
@@ -131,6 +151,14 @@ class Database:
                 ORDER BY created_at
                 """,
             ).fetchall()
+
+    def get_row_by_grouped_id(self, grouped_id: int, channel_id: str) -> Optional[sqlite3.Row]:
+        """Return the DB row of an album (any status), or None if not found."""
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM messages WHERE grouped_id=? AND channel_id=?",
+                (grouped_id, channel_id),
+            ).fetchone()
 
     def get_bale_message_id(self, telegram_message_id: int, channel_id: str) -> Optional[int]:
         with self._connect() as conn:

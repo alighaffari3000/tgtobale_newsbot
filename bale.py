@@ -4,6 +4,7 @@ Docs: https://docs.bale.ai/
 """
 
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 BALE_API_BASE = "https://tapi.bale.ai/bot{token}/{method}"
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+MAX_RATE_LIMIT_RETRIES = 3        # retries after HTTP 429 before giving up
 
 
 class BaleClient:
@@ -27,10 +29,25 @@ class BaleClient:
     def _url(self, method: str) -> str:
         return BALE_API_BASE.format(token=self.bot_token, method=method)
 
+    def _request(self, method: str, **kwargs) -> httpx.Response:
+        """POST to Bale, sleeping and retrying when rate-limited (HTTP 429)."""
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            resp = self._client.post(self._url(method), **kwargs)
+            if resp.status_code != 429 or attempt == MAX_RATE_LIMIT_RETRIES:
+                return resp
+            wait = _retry_after(resp)
+            logger.warning("Bale rate limit [%s], retrying in %ss", method, wait)
+            time.sleep(wait)
+            # open file handles were consumed by the previous upload
+            for f in (kwargs.get("files") or {}).values():
+                if hasattr(f, "seek"):
+                    f.seek(0)
+        return resp
+
     def _post(self, method: str, **kwargs) -> Optional[dict]:
         """Generic POST to Bale API. Returns parsed JSON or None on error."""
         try:
-            resp = self._client.post(self._url(method), **kwargs)
+            resp = self._request(method, **kwargs)
             resp.raise_for_status()
             data = resp.json()
             if not data.get("ok"):
@@ -82,8 +99,8 @@ class BaleClient:
         Falls back to editMessageText if editMessageCaption is not supported (404).
         Returns True on success."""
         try:
-            resp = self._client.post(
-                self._url("editMessageCaption"),
+            resp = self._request(
+                "editMessageCaption",
                 json={
                     "chat_id": self.channel_id,
                     "message_id": bale_message_id,
@@ -154,12 +171,12 @@ class BaleClient:
         return result["result"]["message_id"] if result else None
 
     def send_media_group(self, media_items: list[dict], caption: Optional[str] = None,
-                         reply_to_message_id: Optional[int] = None) -> Optional[int]:
+                         reply_to_message_id: Optional[int] = None) -> list[int]:
         """
         media_items: list of {"type": "photo"|"video"|"document", "path": str}
         Sends all items as a single gallery (sendMediaGroup API).
         Caption goes on the first item only.
-        Returns message_id of first sent item, or None.
+        Returns message_ids of every sent message (first one carries the caption), or [].
 
         Bale API limitation: sendMediaGroup only supports homogeneous groups
         (all photos OR all videos). Mixed photo+video groups always return
@@ -167,18 +184,19 @@ class BaleClient:
         individual sends to avoid the wasted round-trip and the lost caption.
         """
         if not media_items:
-            return None
+            return []
 
         # Filter out missing files
         valid_items = [item for item in media_items if item.get("path") and Path(item["path"]).exists()]
         if not valid_items:
-            return None
+            return []
 
         # If only one item, send individually
         if len(valid_items) == 1:
             item = valid_items[0]
-            return self._send_single_item(item["path"], item.get("type", "photo"), caption,
-                                          reply_to_message_id)
+            msg_id = self._send_single_item(item["path"], item.get("type", "photo"), caption,
+                                            reply_to_message_id)
+            return [msg_id] if msg_id else []
 
         # ── Bale limitation: sendMediaGroup rejects mixed photo+video groups ──
         # Split into homogeneous sub-groups (photos / videos) and send each as its
@@ -197,7 +215,7 @@ class BaleClient:
         return self._send_homogeneous_group(valid_items, caption, reply_to_message_id)
 
     def _send_split_by_type(self, valid_items: list, caption: Optional[str],
-                            reply_to_message_id: Optional[int] = None) -> Optional[int]:
+                            reply_to_message_id: Optional[int] = None) -> list[int]:
         """Send a mixed photo+video group by splitting into homogeneous sub-groups.
 
         Each sub-group is sent as a proper sendMediaGroup call and receives the
@@ -213,7 +231,7 @@ class BaleClient:
         for item in valid_items:
             buckets[item.get("type", "photo")].append(item)
 
-        first_message_id: Optional[int] = None
+        sent_ids: list[int] = []
         caption_sent = False
 
         # Canonical order: photo → video → document
@@ -234,12 +252,12 @@ class BaleClient:
                 msg_id = self._send_single_item(
                     group[0]["path"], media_type, sub_caption, reply_to_message_id
                 )
+                ids = [msg_id] if msg_id else []
             else:
-                msg_id = self._send_homogeneous_group(group, sub_caption, reply_to_message_id)
+                ids = self._send_homogeneous_group(group, sub_caption, reply_to_message_id)
 
-            if msg_id is not None:
-                if first_message_id is None:
-                    first_message_id = msg_id
+            if ids:
+                sent_ids.extend(ids)
                 if sub_caption:
                     caption_sent = True
             else:
@@ -248,13 +266,13 @@ class BaleClient:
         if not caption_sent and caption:
             logger.warning("Caption was never delivered with any sub-group; sending as text.")
             text_id = self.send_text(caption, reply_to_message_id)
-            if text_id and first_message_id is None:
-                first_message_id = text_id
+            if text_id:
+                sent_ids.append(text_id)
 
-        return first_message_id
+        return sent_ids
 
     def _send_homogeneous_group(self, items: list, caption: Optional[str],
-                                reply_to_message_id: Optional[int] = None) -> Optional[int]:
+                                reply_to_message_id: Optional[int] = None) -> list[int]:
         """Send a list of same-type items via sendMediaGroup. No mixed-type check here."""
         import json as _json
 
@@ -299,13 +317,11 @@ class BaleClient:
             if reply_to_message_id:
                 data["reply_to_message_id"] = str(reply_to_message_id)
 
-            resp = self._client.post(self._url("sendMediaGroup"), data=data, files=files)
+            resp = self._request("sendMediaGroup", data=data, files=files)
             result = resp.json()
 
             if result.get("ok"):
-                messages = result.get("result", [])
-                if messages:
-                    return messages[0].get("message_id")
+                return [m["message_id"] for m in result.get("result", []) if m.get("message_id")]
             else:
                 logger.error(
                     "sendMediaGroup (homogeneous) error — status=%s | description=%s | items=%s",
@@ -314,7 +330,7 @@ class BaleClient:
                 if resp.status_code < 500:
                     # Last resort: individual sends for this sub-group
                     return self._fallback_individual(items, caption, reply_to_message_id)
-                return None
+                return []
 
         except httpx.HTTPStatusError as e:
             logger.error(
@@ -327,10 +343,10 @@ class BaleClient:
             logger.error("sendMediaGroup (homogeneous) unexpected error — %s | items=%s",
                          e, media_summary)
 
-        return None
+        return []
 
     def _fallback_individual(self, valid_items: list, caption: Optional[str],
-                             reply_to_message_id: Optional[int] = None) -> Optional[int]:
+                             reply_to_message_id: Optional[int] = None) -> list[int]:
         """Send media group items individually as a fallback.
 
         Caption is placed on the first successfully-sent item. If the first
@@ -341,22 +357,21 @@ class BaleClient:
             len(valid_items),
             bool(caption),
         )
-        first_message_id = None
+        sent_ids: list[int] = []
         caption_sent = False
 
         for item in valid_items:
             # Attach caption to the first item that hasn't had it yet
             item_caption = caption if not caption_sent else None
             # Only the very first message gets reply_to; keep thread tidy
-            reply_id = reply_to_message_id if first_message_id is None else None
+            reply_id = reply_to_message_id if not sent_ids else None
 
             msg_id = self._send_single_item(
                 item["path"], item.get("type", "photo"), item_caption, reply_id
             )
 
             if msg_id is not None:
-                if first_message_id is None:
-                    first_message_id = msg_id
+                sent_ids.append(msg_id)
                 # Mark caption as delivered only after a successful send
                 if item_caption:
                     caption_sent = True
@@ -371,10 +386,10 @@ class BaleClient:
             # All media sends failed or caption never attached — send caption as text
             logger.warning("Caption was never sent with media; sending as standalone text.")
             text_id = self.send_text(caption, reply_to_message_id)
-            if text_id and first_message_id is None:
-                first_message_id = text_id
+            if text_id:
+                sent_ids.append(text_id)
 
-        return first_message_id
+        return sent_ids
 
     def _send_single_item(self, path: str, media_type: str, caption: Optional[str],
                           reply_to_message_id: Optional[int] = None) -> Optional[int]:
@@ -399,6 +414,15 @@ class BaleClient:
 
     def close(self):
         self._client.close()
+
+
+def _retry_after(resp: httpx.Response) -> int:
+    """Seconds to wait from a 429 response (Telegram-style parameters.retry_after), clamped to 1..60."""
+    try:
+        wait = int(resp.json()["parameters"]["retry_after"])
+    except Exception:
+        wait = 5
+    return max(1, min(wait, 60))
 
 
 def _check_size(file_path: str) -> bool:

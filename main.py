@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
@@ -19,14 +20,35 @@ load_dotenv()
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 
+class RedactFilter(logging.Filter):
+    """Mask a secret in every log line. The Bale token is part of each API URL,
+    so httpx request logs and HTTP error messages would otherwise leak it."""
+
+    def __init__(self, secret: str):
+        super().__init__()
+        self.secret = secret
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self.secret:
+            msg = record.getMessage()
+            if self.secret in msg:
+                record.msg = msg.replace(self.secret, "***")
+                record.args = ()
+        return True
+
+
+_handlers = [
+    logging.StreamHandler(sys.stdout),
+    RotatingFileHandler("tg2bale.log", maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8"),
+]
+for _h in _handlers:
+    _h.addFilter(RedactFilter(os.getenv("BALE_BOT_TOKEN", "")))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("tg2bale.log", encoding="utf-8"),
-    ],
+    handlers=_handlers,
 )
 logger = logging.getLogger(__name__)
 

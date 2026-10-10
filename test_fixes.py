@@ -142,9 +142,32 @@ async def test_blocked_edit():
     f, db = make(bale, blocked=["bad"])
     row_id = db.insert_message(20, "-1", "cap", None, None)
     db.mark_sent(row_id, 555)
-    await f._block_after_edit(20, "-1")
+    await f._withdraw_post(20, "-1", "blocked")
     assert bale.deleted == [555]
     assert db.get_row_by_telegram_id(20, "-1")["status"] == "blocked"
+
+
+async def test_source_delete():
+    bale = FakeBale(ok=True)
+    tg = FakeTg()
+    f, db = make(bale, tg)
+    f.register_handlers()
+    on_delete = tg.handlers["on_message_deleted"]
+    album = db.insert_message(40, "-1", "cap", None, "album", None, 88)
+    db.mark_sent(album, 800, [800, 801])
+    db.insert_message(42, "-1", "cap", None, None)  # still queued, never reached Bale
+
+    # whole album removed (ids 40, 41), a queued post (42) and an unknown id (99)
+    await on_delete(SimpleNamespace(deleted_ids=[40, 41, 42, 99], chat_id=-1))
+    assert bale.deleted == [800, 801]
+    assert db.get_row_by_telegram_id(40, "-1")["status"] == "deleted"
+    assert db.get_row_by_telegram_id(42, "-1")["status"] == "deleted"  # never sent anymore
+    assert db.is_known(40, "-1")  # a replayed update must not re-forward it
+    assert db.get_row_by_telegram_id(99, "-1") is None
+
+    # a second delete event for the same post does nothing
+    await on_delete(SimpleNamespace(deleted_ids=[40], chat_id=-1))
+    assert bale.deleted == [800, 801]
 
 
 def test_media_group_returns_all_ids():
@@ -213,6 +236,6 @@ if __name__ == "__main__":
     test_media_group_returns_all_ids()
     test_migration_adds_columns()
     for t in (test_album_survives_retry, test_give_up, test_blocked_album, test_blocked_edit,
-              test_album_edit):
+              test_source_delete, test_album_edit):
         asyncio.run(t())
     print("all checks passed")

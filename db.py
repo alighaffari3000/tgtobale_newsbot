@@ -125,7 +125,8 @@ class Database:
             conn.commit()
 
     def set_status(self, row_id: int, status: str):
-        """Move a row to a terminal status: 'failed' (gave up) or 'blocked' (blocked word after edit)."""
+        """Move a row to a terminal status: 'failed' (gave up), 'blocked' (blocked word after edit)
+        or 'deleted' (post removed in Telegram)."""
         with self._connect() as conn:
             conn.execute("UPDATE messages SET status=? WHERE id=?", (status, row_id))
             conn.commit()

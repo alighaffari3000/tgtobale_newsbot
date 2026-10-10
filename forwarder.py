@@ -131,7 +131,7 @@ class Forwarder:
 
             # ویرایشی که کلمه مسدود اضافه کرده: از بله حذف کن / از صف خارج کن
             if self._is_blocked(msg.message):
-                await self._block_after_edit(tg_id, channel_id)
+                await self._withdraw_post(tg_id, channel_id, "blocked")
                 return
 
             new_text = _entities_to_markdown(msg.message, msg.entities) if msg.message is not None else None
@@ -208,6 +208,13 @@ class Forwarder:
                 self.db.update_caption(tg_id, channel_id, new_caption or "")
                 logger.info("Pending post caption updated before send (msg_id=%s, channel=%s)",
                             tg_id, channel_id)
+
+        @self.tg.on(events.MessageDeleted(chats=self.source_channels))
+        async def on_message_deleted(event):
+            # ponytail: آلبوم با شناسه‌ی اولین آیتمش ذخیره شده؛ حذف فقط یک آیتم دیگرِ آلبوم نادیده گرفته می‌شود
+            channel_id = str(event.chat_id)
+            for tg_id in event.deleted_ids:
+                await self._withdraw_post(tg_id, channel_id, "deleted")
 
     # ── Media group buffering ─────────────────────────────────────────────────
 
@@ -646,8 +653,9 @@ class Forwarder:
         logger.error("Giving up on row_id=%s after %d attempts", row["id"], MAX_SEND_ATTEMPTS)
         return True
 
-    async def _block_after_edit(self, telegram_message_id: int, channel_id: str):
-        """An edit added a blocked word: delete the Bale copy, or drop it from the queue."""
+    async def _withdraw_post(self, telegram_message_id: int, channel_id: str, status: str):
+        """Take a post off Bale — delete the Bale copy, or drop it from the queue — and record
+        why in the row: 'blocked' (edit added a blocked word) or 'deleted' (removed in Telegram)."""
         row = self.db.get_row_by_telegram_id(telegram_message_id, channel_id)
         if not row or row["status"] not in ("sent", "pending"):
             return
@@ -656,13 +664,13 @@ class Forwarder:
             failed = [mid for mid in ids
                       if not await asyncio.to_thread(self.bale.delete_message, mid)]
             if failed:
-                # stays 'sent', so a later edit retries the delete
-                logger.warning("Could not delete Bale messages %s for blocked edit", failed)
+                # stays 'sent', so the leftover Bale copies remain visible in the DB
+                logger.warning("Could not delete Bale messages %s (%s post)", failed, status)
                 return
         _remove_row_media(row)
-        self.db.set_status(row["id"], "blocked")
-        logger.info("Post blocked after edit (msg_id=%s, channel=%s, was %s)",
-                    telegram_message_id, channel_id, row["status"])
+        self.db.set_status(row["id"], status)
+        logger.info("Post %s (msg_id=%s, channel=%s, was %s)",
+                    status, telegram_message_id, channel_id, row["status"])
 
     # ── Retry & connectivity loops ────────────────────────────────────────────
 

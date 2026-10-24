@@ -49,9 +49,11 @@ class BaleClient:
         try:
             resp = self._request(method, **kwargs)
             # a 400 never heals on retry; the usual causes are Markdown Bale can't parse or a
-            # reply target gone from Bale, so drop those in turn (text then shows raw Markdown)
+            # reply target gone from Bale, so drop those in turn (text then shows raw Markdown).
+            # Sends only: an edit's 400 may be "not modified", and retrying it without Markdown
+            # would replace a fine post with raw Markdown
             for field in ("parse_mode", "reply_to_message_id"):
-                if resp.status_code == 400 and _drop_field(kwargs, field):
+                if resp.status_code == 400 and method.startswith("send") and _drop_field(kwargs, field):
                     logger.warning("Bale rejected [%s] with 400, retrying without %s", method, field)
                     resp = self._request(method, **kwargs)
             resp.raise_for_status()

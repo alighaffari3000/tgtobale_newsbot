@@ -190,6 +190,9 @@ class Forwarder:
                                                                          new_media_type))
                     return
 
+                if db_row and db_row["caption"] == new_caption and not db_row["pending_action"]:
+                    return  # Bale already shows this text; editing would only fail as "not modified"
+
                 logger.info("Post edited in channel %s (msg_id=%s), updating Bale msg %s",
                             channel_id, msg.id, bale_msg_id)
 
@@ -416,9 +419,11 @@ class Forwarder:
         if self.db.mark_sent(row_id, bale_ids[0], bale_ids):
             return True
         row = self.db.get_row(row_id)
+        self.db.mark_sent(row_id, bale_ids[0], bale_ids, only_pending=False)
+        if row["status"] not in ("deleted", "blocked"):
+            return True  # e.g. expired ('failed') mid-send: it did reach Bale, so record that
         logger.info("row_id=%s was %s during its send, removing Bale copy %s",
                     row_id, row["status"], bale_ids)
-        self.db.mark_sent(row_id, bale_ids[0], bale_ids, only_pending=False)
         await self._withdraw_post(row["telegram_message_id"], row["channel_id"], row["status"])
         return False
 

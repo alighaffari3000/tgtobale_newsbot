@@ -256,6 +256,29 @@ def test_400_drops_markdown_then_reply():
     assert c.send_text("*broken", reply_to_message_id=5) == 8
     assert len(sent) == 3 and sent[-1]["text"] == "*broken"
 
+    # an edit's 400 (e.g. "not modified") is not retried as raw Markdown
+    sent.clear()
+    assert not c.edit_message_text(5, "*fine*")
+    assert len(sent) == 1
+
+
+async def test_unchanged_edit_skipped_and_resend_clears_action():
+    bale = FakeBale(ok=True)
+    tg = FakeTg()
+    f, db = make(bale, tg)
+    f.register_handlers()
+    m = msg(80, "same")
+    m.media = None
+    row_id = db.insert_message(80, "-1", fw._build_footer("same", "@src", fw._format_date(m.date)),
+                               None, None)
+    db.mark_sent(row_id, 1000)
+    bale.edit_message_text = lambda *a: (_ for _ in ()).throw(AssertionError("should not edit"))
+    await tg.handlers["on_message_edited"](SimpleNamespace(message=m, chat_id=-1))
+
+    db.set_pending_action(row_id, "edit")
+    db.reset_for_resend(row_id)
+    assert db.get_row(row_id)["pending_action"] is None
+
 
 async def test_blocked_album():
     fw.MEDIA_GROUP_WAIT = 0
@@ -371,6 +394,7 @@ if __name__ == "__main__":
     for t in (test_album_survives_retry, test_give_up, test_blocked_album, test_blocked_edit,
               test_source_delete, test_album_edit, test_expire_during_outage,
               test_interrupted_send_requeued, test_bad_row_does_not_block_queue,
-              test_failed_delete_and_edit_retried, test_withdrawn_during_send):
+              test_failed_delete_and_edit_retried, test_withdrawn_during_send,
+              test_unchanged_edit_skipped_and_resend_clears_action):
         asyncio.run(t())
     print("all checks passed")

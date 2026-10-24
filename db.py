@@ -232,32 +232,8 @@ class Database:
         with self._connect() as conn:
             conn.execute(
                 """UPDATE messages
-                   SET status='pending', bale_message_id=NULL,
-                       media_paths=NULL, media_type=NULL, retry_count=0
-                   WHERE id=?""",
-                (row_id,),
-            )
-            conn.commit()
-        logger.debug("DB row %s reset for re-send", row_id)
-
-    def get_row_by_telegram_id(self, telegram_message_id: int, channel_id: str) -> Optional[sqlite3.Row]:
-        """Return the full DB row for a message (any status), or None if not found."""
-        with self._connect() as conn:
-            return conn.execute(
-                "SELECT * FROM messages WHERE telegram_message_id=? AND channel_id=?",
-                (telegram_message_id, channel_id),
-            ).fetchone()
-
-    def reset_for_resend(self, row_id: int):
-        """
-        Reset a sent row back to pending so it can be re-sent with new media.
-        Used when a Telegram post is edited to add media after being sent as text.
-        """
-        with self._connect() as conn:
-            conn.execute(
-                """UPDATE messages
-                   SET status='pending', bale_message_id=NULL,
-                       media_paths=NULL, media_type=NULL, retry_count=0
+                   SET status='pending', bale_message_id=NULL, bale_message_ids=NULL,
+                       media_paths=NULL, media_type=NULL, retry_count=0, pending_action=NULL
                    WHERE id=?""",
                 (row_id,),
             )

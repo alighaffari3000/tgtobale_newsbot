@@ -262,6 +262,23 @@ def test_400_drops_markdown_then_reply():
     assert len(sent) == 1
 
 
+def test_connections_closed():
+    import sqlite3
+    db = Database("fd.db")
+    with db._connect() as conn:
+        conn.execute("SELECT 1")
+    try:
+        conn.execute("SELECT 1")
+        assert False, "connection left open (leaks fds)"
+    except sqlite3.ProgrammingError:
+        pass
+    # the with block still commits
+    with db._connect() as conn:
+        conn.execute("INSERT INTO messages (telegram_message_id, channel_id, created_at) "
+                     "VALUES (1, 'c', 'now')")
+    assert db.is_known(1, "c")
+
+
 async def test_unchanged_edit_skipped_and_resend_clears_action():
     bale = FakeBale(ok=True)
     tg = FakeTg()
@@ -391,6 +408,7 @@ if __name__ == "__main__":
     test_bold_link_markdown()
     test_400_drops_markdown_then_reply()
     test_partial_album_rolled_back()
+    test_connections_closed()
     for t in (test_album_survives_retry, test_give_up, test_blocked_album, test_blocked_edit,
               test_source_delete, test_album_edit, test_expire_during_outage,
               test_interrupted_send_requeued, test_bad_row_does_not_block_queue,

@@ -124,6 +124,18 @@ class Database:
             )
             conn.commit()
 
+    def requeue_new(self, row_id: Optional[int] = None) -> int:
+        """Hand pending rows whose first send never finished (crash, restart, unexpected error)
+        to the retry loops, which only pick up retry_count >= 1. No row_id = all such rows."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE messages SET retry_count=1 WHERE status='pending' AND retry_count=0"
+                + (" AND id=?" if row_id is not None else ""),
+                (row_id,) if row_id is not None else (),
+            )
+            conn.commit()
+            return cur.rowcount
+
     def set_status(self, row_id: int, status: str):
         """Move a row to a terminal status: 'failed' (gave up), 'blocked' (blocked word after edit)
         or 'deleted' (post removed in Telegram)."""

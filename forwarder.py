@@ -40,7 +40,7 @@ IMMEDIATE_RETRY_DELAY = 60    # 1 minute before the one immediate retry
 MEDIA_STORE_DIR = "pending_media"  # persistent storage for pending message media
 BALE_CAPTION_LIMIT = 4096     # Bale max caption length
 BALE_MAX_MEDIA_BYTES = 20 * 1024 * 1024  # Bale 20 MB upload limit
-MAX_SEND_ATTEMPTS = 10       # give up (status='failed') after this many failed sends
+MAX_PENDING_AGE = timedelta(hours=48)  # give up (status='failed') on posts still unsent after this long
 
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -183,7 +183,8 @@ class Forwarder:
                         msg.id, channel_id, new_caption, None, new_media_type
                     )
                     if row_id:
-                        await self._send_single(msg, new_caption, row_id, new_media_type)
+                        await self._first_send(row_id, self._send_single(msg, new_caption, row_id,
+                                                                         new_media_type))
                     return
 
                 logger.info("Post edited in channel %s (msg_id=%s), updating Bale msg %s",
@@ -347,7 +348,8 @@ class Forwarder:
             return
 
         logger.info("Processing media group (%d items) from channel: %s", len(messages), channel_id)
-        await self._send_media_group(messages, caption, row_id, reply_to_bale_id)
+        await self._first_send(row_id, self._send_media_group(messages, caption, row_id,
+                                                              reply_to_bale_id))
 
     # ── Single message ────────────────────────────────────────────────────────
 
@@ -389,7 +391,17 @@ class Forwarder:
         if row_id is None:
             return
 
-        await self._send_single(msg, caption, row_id, media_type, reply_to_bale_id)
+        await self._first_send(row_id, self._send_single(msg, caption, row_id, media_type,
+                                                         reply_to_bale_id))
+
+    async def _first_send(self, row_id: int, send):
+        """Await a post's first send; if it raises, hand the row to the retry loops
+        instead of leaving it pending at retry_count=0, where no loop ever picks it up."""
+        try:
+            await send
+        except Exception:
+            logger.exception("Unexpected error sending row_id=%s, queued for retry", row_id)
+            self.db.requeue_new(row_id)
 
     async def _send_single(self, msg, caption: Optional[str], row_id: int,
                            media_type: Optional[str] = None,
@@ -644,13 +656,13 @@ class Forwarder:
             return await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id)
         return None
 
-    def _give_up_if_exhausted(self, row) -> bool:
-        """After MAX_SEND_ATTEMPTS failures, mark the row 'failed' and drop its media."""
-        if row["retry_count"] + 1 < MAX_SEND_ATTEMPTS:
+    def _give_up_if_expired(self, row) -> bool:
+        """Once a row is older than MAX_PENDING_AGE, mark it 'failed' and drop its media."""
+        if datetime.now(timezone.utc) - datetime.fromisoformat(row["created_at"]) < MAX_PENDING_AGE:
             return False
         self.db.set_status(row["id"], "failed")
         _remove_row_media(row)
-        logger.error("Giving up on row_id=%s after %d attempts", row["id"], MAX_SEND_ATTEMPTS)
+        logger.error("Giving up on row_id=%s: unsent for over %s", row["id"], MAX_PENDING_AGE)
         return True
 
     async def _withdraw_post(self, telegram_message_id: int, channel_id: str, status: str):
@@ -684,12 +696,14 @@ class Forwarder:
             try:
                 rows = self.db.get_immediate_retries()
                 for row in rows:
+                    if self._give_up_if_expired(row):
+                        continue
                     logger.info("Retry attempt #1 for row_id=%s", row["id"])
                     sent_id = await self._send_pending_row(row)
                     if sent_id:
                         self.db.mark_sent(row["id"], sent_id)
                         logger.info("Post sent to Bale successfully on retry (row_id=%s)", row["id"])
-                    elif not self._give_up_if_exhausted(row):
+                    else:
                         self.db.mark_failed(row["id"], row["retry_count"])
                         logger.warning("Retry failed for row_id=%s, moved to pending queue", row["id"])
             except Exception as e:
@@ -703,13 +717,15 @@ class Forwarder:
         while True:
             await asyncio.sleep(CONNECTIVITY_POLL)
             try:
+                # expire stale posts first, so a long outage doesn't flood Bale with old news on return
+                rows = [r for r in self.db.get_queued_pending() if not self._give_up_if_expired(r)]
+
                 reachable = await asyncio.to_thread(self.bale.check_connectivity)
                 if not reachable:
                     logger.info("Bale connectivity check: unreachable. Queue preserved.")
                     continue
 
                 logger.info("Bale connectivity check: OK. Flushing pending queue...")
-                rows = self.db.get_queued_pending()
                 if not rows:
                     logger.info("No queued messages to flush.")
                     continue
@@ -719,7 +735,7 @@ class Forwarder:
                     if sent_id:
                         self.db.mark_sent(row["id"], sent_id)
                         logger.info("Queued post sent to Bale (row_id=%s)", row["id"])
-                    elif not self._give_up_if_exhausted(row):
+                    else:
                         self.db.mark_failed(row["id"], row["retry_count"])
                         logger.warning("Failed to flush queued post (row_id=%s), keeping in queue", row["id"])
             except Exception as e:
@@ -800,12 +816,13 @@ def _entities_to_markdown(text: str, entities) -> str:
         # Underline and Strike are not supported in Bale Markdown — render as plain text
 
     # Build a sorted list of insertions: (str_index, priority, text_to_insert)
-    # priority 0 = open marker, 1 = close marker
+    # priority 0 = close marker, 1 = open marker, 2 = link — at a shared position a span
+    # closes before the next opens, and a link sits inside any span starting there
     insertions: list[tuple[int, int, str]] = []
 
     for start, end, open_m, close_m in spans:
-        insertions.append((start, 0, open_m))
-        insertions.append((end, 1, close_m))
+        insertions.append((start, 1, open_m))
+        insertions.append((end, 0, close_m))
 
     # For link spans, we use "replace" entries: a single insertion at `start`
     # that contains the full [text](url) string, and we skip over [start, end)
@@ -820,7 +837,7 @@ def _entities_to_markdown(text: str, entities) -> str:
         full_link = f"[{escaped_text}]({escaped_url})"
         replace_spans.append((start, end, full_link))
         # Add a sentinel insertion at `start` so the build loop processes this position
-        insertions.append((start, 0, ""))  # placeholder; handled via replace_spans
+        insertions.append((start, 2, ""))  # placeholder; handled via replace_spans
 
     insertions.sort(key=lambda x: (x[0], x[1]))
 
@@ -838,7 +855,7 @@ def _entities_to_markdown(text: str, entities) -> str:
                 return rs, re, rt
         return None
 
-    for str_index, _priority, marker in insertions:
+    for str_index, priority, marker in insertions:
         if str_index > prev:
             segment = text[prev:str_index]
             if _in_skip_range(prev, str_index, skip_escape, link_spans):
@@ -846,7 +863,7 @@ def _entities_to_markdown(text: str, entities) -> str:
             else:
                 result_parts.append(_escape_markdown(segment))
         # Check if this position is the start of a link replace span
-        rep = _get_replace(str_index)
+        rep = _get_replace(str_index) if priority == 2 else None
         if rep is not None:
             rs, re, rt = rep
             result_parts.append(rt)

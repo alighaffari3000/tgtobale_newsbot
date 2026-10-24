@@ -85,6 +85,10 @@ async def main():
 
     # ── Initialize components ────────────────────────────────────────────────
     db = Database(db_path)
+    # nothing is mid-send at startup, so first sends cut off by the last shutdown go to the retry loops
+    requeued = db.requeue_new()
+    if requeued:
+        logger.info("Requeued %d post(s) interrupted by the last shutdown", requeued)
     bale = BaleClient(bale_token, bale_channel_id)
 
     tg_client = TelegramClient(session_name, api_id, api_hash)

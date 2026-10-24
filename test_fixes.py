@@ -120,11 +120,68 @@ async def test_give_up():
     row_id = db.insert_message(2, "-1", "cap", None, "photo")
     Path("pending_media/g.jpg").write_bytes(b"x")
     db.update_media(row_id, "pending_media/g.jpg", "photo")
-    db.mark_failed(row_id, fw.MAX_SEND_ATTEMPTS - 2)
     row = db.get_row_by_telegram_id(2, "-1")
-    assert f._give_up_if_exhausted(row)
+    assert not f._give_up_if_expired(row)  # fresh post is kept
+    row = dict(row, created_at=(datetime.now(timezone.utc) - fw.MAX_PENDING_AGE).isoformat())
+    assert f._give_up_if_expired(row)
     assert db.get_row_by_telegram_id(2, "-1")["status"] == "failed"
     assert not Path("pending_media/g.jpg").exists()
+
+
+async def test_expire_during_outage():
+    bale = FakeBale(ok=True)
+    bale.check_connectivity = lambda: False
+    f, db = make(bale)
+    old = db.insert_message(3, "-1", "cap", None, None)
+    db.mark_failed(old, 1)  # queued (retry_count=2)
+    with db._connect() as c:
+        c.execute("UPDATE messages SET created_at=? WHERE id=?",
+                  ((datetime.now(timezone.utc) - fw.MAX_PENDING_AGE).isoformat(), old))
+    fresh = db.insert_message(4, "-1", "cap", None, None)
+    db.mark_failed(fresh, 1)
+    fw.CONNECTIVITY_POLL = 0
+    task = asyncio.create_task(f.connectivity_loop())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    assert db.get_row_by_telegram_id(3, "-1")["status"] == "failed"  # expired though Bale is down
+    assert db.get_row_by_telegram_id(4, "-1")["status"] == "pending"
+
+
+async def test_interrupted_send_requeued():
+    f, db = make(FakeBale(ok=True))
+    crashed = db.insert_message(5, "-1", "cap", None, None)  # left at retry_count=0 by a crash
+    sent = db.insert_message(6, "-1", "cap", None, None)
+    db.mark_sent(sent, 1)
+    assert db.requeue_new() == 1
+    assert [r["id"] for r in db.get_immediate_retries()] == [crashed]
+
+    async def boom():
+        raise ValueError("unexpected")
+    row_id = db.insert_message(7, "-1", "cap", None, None)
+    await f._first_send(row_id, boom())
+    assert db.get_row_by_telegram_id(7, "-1")["retry_count"] == 1
+
+
+def test_bold_link_markdown():
+    from telethon.tl.types import MessageEntityBold, MessageEntityTextUrl
+    ents = [MessageEntityBold(0, 5), MessageEntityTextUrl(0, 5, "http://x")]
+    assert fw._entities_to_markdown("hello world", ents) == "*[hello](http://x)* world"
+
+
+def test_400_drops_markdown_then_reply():
+    sent = []
+
+    def handler(req):
+        body = json.loads(req.read())
+        sent.append(body)
+        if "parse_mode" in body or "reply_to_message_id" in body:
+            return httpx.Response(400, json={"ok": False, "description": "bad request"})
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 8}})
+
+    c = BaleClient("TOKEN", "123")
+    c._client = httpx.Client(transport=httpx.MockTransport(handler))
+    assert c.send_text("*broken", reply_to_message_id=5) == 8
+    assert len(sent) == 3 and sent[-1]["text"] == "*broken"
 
 
 async def test_blocked_album():
@@ -235,7 +292,10 @@ if __name__ == "__main__":
     test_rate_limit_retry()
     test_media_group_returns_all_ids()
     test_migration_adds_columns()
+    test_bold_link_markdown()
+    test_400_drops_markdown_then_reply()
     for t in (test_album_survives_retry, test_give_up, test_blocked_album, test_blocked_edit,
-              test_source_delete, test_album_edit):
+              test_source_delete, test_album_edit, test_expire_during_outage,
+              test_interrupted_send_requeued):
         asyncio.run(t())
     print("all checks passed")

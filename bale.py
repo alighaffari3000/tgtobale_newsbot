@@ -32,22 +32,28 @@ class BaleClient:
     def _request(self, method: str, **kwargs) -> httpx.Response:
         """POST to Bale, sleeping and retrying when rate-limited (HTTP 429)."""
         for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            # open file handles may have been consumed by a previous upload of this request
+            for f in (kwargs.get("files") or {}).values():
+                if hasattr(f, "seek"):
+                    f.seek(0)
             resp = self._client.post(self._url(method), **kwargs)
             if resp.status_code != 429 or attempt == MAX_RATE_LIMIT_RETRIES:
                 return resp
             wait = _retry_after(resp)
             logger.warning("Bale rate limit [%s], retrying in %ss", method, wait)
             time.sleep(wait)
-            # open file handles were consumed by the previous upload
-            for f in (kwargs.get("files") or {}).values():
-                if hasattr(f, "seek"):
-                    f.seek(0)
         return resp
 
     def _post(self, method: str, **kwargs) -> Optional[dict]:
         """Generic POST to Bale API. Returns parsed JSON or None on error."""
         try:
             resp = self._request(method, **kwargs)
+            # a 400 never heals on retry; the usual causes are Markdown Bale can't parse or a
+            # reply target gone from Bale, so drop those in turn (text then shows raw Markdown)
+            for field in ("parse_mode", "reply_to_message_id"):
+                if resp.status_code == 400 and _drop_field(kwargs, field):
+                    logger.warning("Bale rejected [%s] with 400, retrying without %s", method, field)
+                    resp = self._request(method, **kwargs)
             resp.raise_for_status()
             data = resp.json()
             if not data.get("ok"):
@@ -423,6 +429,12 @@ def _retry_after(resp: httpx.Response) -> int:
     except Exception:
         wait = 5
     return max(1, min(wait, 60))
+
+
+def _drop_field(kwargs: dict, field: str) -> bool:
+    """Remove field from the request's json/data payload. True if it was there."""
+    payload = kwargs.get("json") or kwargs.get("data") or {}
+    return payload.pop(field, None) is not None
 
 
 def _check_size(file_path: str) -> bool:

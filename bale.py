@@ -238,7 +238,6 @@ class BaleClient:
             buckets[item.get("type", "photo")].append(item)
 
         sent_ids: list[int] = []
-        caption_sent = False
 
         # Canonical order: photo → video → document
         for media_type in ("photo", "video", "document"):
@@ -246,8 +245,8 @@ class BaleClient:
             if not group:
                 continue
 
-            # Every sub-group gets the caption so it is never missing
-            sub_caption = caption if not caption_sent else None
+            # caption rides on the first sub-group only
+            sub_caption = caption if not sent_ids else None
 
             logger.info(
                 "Sending sub-group: %d %s(s) (caption present: %s)",
@@ -262,20 +261,21 @@ class BaleClient:
             else:
                 ids = self._send_homogeneous_group(group, sub_caption, reply_to_message_id)
 
-            if ids:
-                sent_ids.extend(ids)
-                if sub_caption:
-                    caption_sent = True
-            else:
+            if not ids:
                 logger.warning("Sub-group send failed for type=%s", media_type)
-
-        if not caption_sent and caption:
-            logger.warning("Caption was never delivered with any sub-group; sending as text.")
-            text_id = self.send_text(caption, reply_to_message_id)
-            if text_id:
-                sent_ids.append(text_id)
+                return self._rollback(sent_ids)
+            sent_ids.extend(ids)
 
         return sent_ids
+
+    def _rollback(self, sent_ids: list[int]) -> list[int]:
+        """Delete the part of an album that did get through and report failure, so the caller
+        retries the whole album instead of keeping it half-sent. Always returns []."""
+        if sent_ids:
+            logger.warning("Album only partly sent; deleting %s so it is retried whole", sent_ids)
+            for mid in sent_ids:
+                self.delete_message(mid)
+        return []
 
     def _send_homogeneous_group(self, items: list, caption: Optional[str],
                                 reply_to_message_id: Optional[int] = None) -> list[int]:
@@ -355,8 +355,8 @@ class BaleClient:
                              reply_to_message_id: Optional[int] = None) -> list[int]:
         """Send media group items individually as a fallback.
 
-        Caption is placed on the first successfully-sent item. If the first
-        item fails, the caption shifts to the next one so it is never lost.
+        Caption goes on the first item. All or nothing: if any item fails, the ones
+        already sent are deleted and [] is returned so the album is retried whole.
         """
         logger.warning(
             "Sending %d media items individually (caption present: %s)",
@@ -364,11 +364,9 @@ class BaleClient:
             bool(caption),
         )
         sent_ids: list[int] = []
-        caption_sent = False
 
         for item in valid_items:
-            # Attach caption to the first item that hasn't had it yet
-            item_caption = caption if not caption_sent else None
+            item_caption = caption if not sent_ids else None
             # Only the very first message gets reply_to; keep thread tidy
             reply_id = reply_to_message_id if not sent_ids else None
 
@@ -376,24 +374,14 @@ class BaleClient:
                 item["path"], item.get("type", "photo"), item_caption, reply_id
             )
 
-            if msg_id is not None:
-                sent_ids.append(msg_id)
-                # Mark caption as delivered only after a successful send
-                if item_caption:
-                    caption_sent = True
-            else:
+            if msg_id is None:
                 logger.warning(
                     "Individual send failed for item %s (type=%s)",
                     Path(item["path"]).name,
                     item.get("type"),
                 )
-
-        if not caption_sent and caption:
-            # All media sends failed or caption never attached — send caption as text
-            logger.warning("Caption was never sent with media; sending as standalone text.")
-            text_id = self.send_text(caption, reply_to_message_id)
-            if text_id:
-                sent_ids.append(text_id)
+                return self._rollback(sent_ids)
+            sent_ids.append(msg_id)
 
         return sent_ids
 

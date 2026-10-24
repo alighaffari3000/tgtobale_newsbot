@@ -41,6 +41,7 @@ MEDIA_STORE_DIR = "pending_media"  # persistent storage for pending message medi
 BALE_CAPTION_LIMIT = 4096     # Bale max caption length
 BALE_MAX_MEDIA_BYTES = 20 * 1024 * 1024  # Bale 20 MB upload limit
 MAX_PENDING_AGE = timedelta(hours=48)  # give up (status='failed') on posts still unsent after this long
+MAX_ACTION_ATTEMPTS = 10      # give up on a failed Bale edit/delete after this many tries while Bale is up
 
 TEHRAN_TZ = ZoneInfo("Asia/Tehran")
 
@@ -148,6 +149,8 @@ class Forwarder:
                 tg_has_media = bool(msg.media and not isinstance(msg.media, MessageMediaWebPage))
                 db_row = self.db.get_row_by_telegram_id(tg_id, channel_id)
                 db_media_type = db_row["media_type"] if db_row else None
+                if db_row and db_row["pending_action"] in ("deleted", "blocked"):
+                    return  # already queued to come off Bale
 
                 # ── FIX: پست اول بدون عکس ارسال شده، بعد در تلگرام عکس اضافه شده ──
                 # در این حالت پیام بله یه text message هست ولی تلگرام الان media داره.
@@ -196,11 +199,15 @@ class Forwarder:
                 else:
                     success = await asyncio.to_thread(self.bale.edit_message_text, bale_msg_id, new_caption)
 
+                self.db.update_caption(tg_id, channel_id, new_caption)
                 if success:
-                    self.db.update_caption(tg_id, channel_id, new_caption)
+                    if db_row and db_row["pending_action"] == "edit":
+                        self.db.set_pending_action(db_row["id"], None)  # this newer edit replaces it
                     logger.info("Bale message %s updated successfully", bale_msg_id)
-                else:
-                    logger.warning("Failed to update Bale message %s", bale_msg_id)
+                elif db_row:
+                    # connectivity_loop re-applies the stored caption once Bale is reachable
+                    self.db.set_pending_action(db_row["id"], "edit")
+                    logger.warning("Failed to update Bale message %s, will retry", bale_msg_id)
                 return
 
             # Case 2: still pending (not yet sent) → update the stored caption so
@@ -403,6 +410,18 @@ class Forwarder:
             logger.exception("Unexpected error sending row_id=%s, queued for retry", row_id)
             self.db.requeue_new(row_id)
 
+    async def _record_sent(self, row_id: int, bale_ids: list[int]) -> bool:
+        """Mark a row sent. If it was withdrawn (deleted/blocked in Telegram) while its send was
+        in flight, take the fresh Bale copy down instead and return False."""
+        if self.db.mark_sent(row_id, bale_ids[0], bale_ids):
+            return True
+        row = self.db.get_row(row_id)
+        logger.info("row_id=%s was %s during its send, removing Bale copy %s",
+                    row_id, row["status"], bale_ids)
+        self.db.mark_sent(row_id, bale_ids[0], bale_ids, only_pending=False)
+        await self._withdraw_post(row["telegram_message_id"], row["channel_id"], row["status"])
+        return False
+
     async def _send_single(self, msg, caption: Optional[str], row_id: int,
                            media_type: Optional[str] = None,
                            reply_to_bale_id: Optional[int] = None):
@@ -440,17 +459,18 @@ class Forwarder:
                                                       reply_to_bale_id)
 
         if bale_msg_id:
-            self.db.mark_sent(row_id, bale_msg_id)
             _safe_remove(downloaded_path or "")
-            logger.info("Post sent to Bale successfully (row_id=%s, bale_msg=%s)", row_id, bale_msg_id)
-            # Send overflow caption as a reply if needed
-            await self._send_caption_overflow(caption, bale_msg_id)
-        else:
+            if await self._record_sent(row_id, [bale_msg_id]):
+                logger.info("Post sent to Bale successfully (row_id=%s, bale_msg=%s)", row_id, bale_msg_id)
+                # Send overflow caption as a reply if needed
+                await self._send_caption_overflow(caption, bale_msg_id)
+        elif self.db.mark_failed(row_id, 0):
             # Persist media path so retry loops can use it
             if downloaded_path:
                 self.db.update_media(row_id, downloaded_path, media_type or "")
-            self.db.mark_failed(row_id, 0)
             logger.warning("Failed to send post to Bale (row_id=%s), will retry", row_id)
+        else:  # withdrawn mid-send: nothing will retry it
+            _safe_remove(downloaded_path or "")
 
     # ── Media group send ──────────────────────────────────────────────────────
 
@@ -487,24 +507,26 @@ class Forwarder:
                 self.bale.send_media_group, media_items, caption, reply_to_bale_id
             )
 
-        if not bale_ids and caption:
+        elif caption:
+            # text only when there is no media to send; a failed album is retried with its media
             text_id = await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id)
             bale_ids = [text_id] if text_id else []
 
-        bale_msg_id = bale_ids[0] if bale_ids else None
-        if bale_msg_id:
-            self.db.mark_sent(row_id, bale_msg_id, bale_ids)
+        if bale_ids:
             for item in media_items:
                 _safe_remove(item["path"])
-            logger.info("Post sent to Bale successfully (row_id=%s, media_group)", row_id)
-            # Send overflow caption as a reply if needed
-            await self._send_caption_overflow(caption, bale_msg_id)
-        else:
+            if await self._record_sent(row_id, bale_ids):
+                logger.info("Post sent to Bale successfully (row_id=%s, media_group)", row_id)
+                # Send overflow caption as a reply if needed
+                await self._send_caption_overflow(caption, bale_ids[0])
+        elif self.db.mark_failed(row_id, 0):
             # Keep downloaded files so retry loops can re-send the whole album
             if media_items:
                 self.db.update_media(row_id, json.dumps(media_items), "album")
-            self.db.mark_failed(row_id, 0)
             logger.warning("Failed to send post to Bale (row_id=%s), will retry", row_id)
+        else:  # withdrawn mid-send: nothing will retry it
+            for item in media_items:
+                _safe_remove(item["path"])
 
     # ── Media helpers ─────────────────────────────────────────────────────────
 
@@ -601,9 +623,9 @@ class Forwarder:
 
     # ── Pending row send helper ───────────────────────────────────────────────
 
-    async def _send_pending_row(self, row) -> Optional[int]:
+    async def _send_pending_row(self, row) -> list[int]:
         """
-        Send a pending DB row to Bale.
+        Send a pending DB row to Bale; returns the Bale message ids ([] on failure).
         Uses stored media file if available, otherwise falls back to text.
         Cleans up media file on success.
         """
@@ -622,13 +644,10 @@ class Forwarder:
             if items:
                 sent_ids = await asyncio.to_thread(self.bale.send_media_group, items, caption,
                                                    reply_to_bale_id)
-                if not sent_ids:
-                    return None
-                # store all album ids now; the caller's mark_sent(id) keeps them
-                self.db.mark_sent(row["id"], sent_ids[0], sent_ids)
-                for i in items:
-                    _safe_remove(i["path"])
-                return sent_ids[0]
+                if sent_ids:
+                    for i in items:
+                        _safe_remove(i["path"])
+                return sent_ids
             # files gone — fall through to text
 
         elif media_path and media_type and Path(media_path).exists():
@@ -641,20 +660,17 @@ class Forwarder:
                     row["id"],
                 )
                 _safe_remove(media_path)
-                updated_caption = _caption_with_oversize_note(caption, None)
-                if updated_caption:
-                    return await asyncio.to_thread(self.bale.send_text, updated_caption,
-                                                   reply_to_bale_id)
-                return None
+                caption = _caption_with_oversize_note(caption, None)
+                sent_id = await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id)
+                return [sent_id] if sent_id else []
             sent_id = await self._send_media_file(media_path, media_type, caption, reply_to_bale_id)
             if sent_id:
                 _safe_remove(media_path)
-            return sent_id
+            return [sent_id] if sent_id else []
 
         # No media (or file missing) — send as text
-        if caption:
-            return await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id)
-        return None
+        sent_id = await asyncio.to_thread(self.bale.send_text, caption, reply_to_bale_id) if caption else None
+        return [sent_id] if sent_id else []
 
     def _give_up_if_expired(self, row) -> bool:
         """Once a row is older than MAX_PENDING_AGE, mark it 'failed' and drop its media."""
@@ -665,9 +681,11 @@ class Forwarder:
         logger.error("Giving up on row_id=%s: unsent for over %s", row["id"], MAX_PENDING_AGE)
         return True
 
-    async def _withdraw_post(self, telegram_message_id: int, channel_id: str, status: str):
+    async def _withdraw_post(self, telegram_message_id: int, channel_id: str, status: str,
+                             attempts: int = 0):
         """Take a post off Bale — delete the Bale copy, or drop it from the queue — and record
-        why in the row: 'blocked' (edit added a blocked word) or 'deleted' (removed in Telegram)."""
+        why in the row: 'blocked' (edit added a blocked word) or 'deleted' (removed in Telegram).
+        attempts: earlier failed tries, when called from the pending-action retry."""
         row = self.db.get_row_by_telegram_id(telegram_message_id, channel_id)
         if not row or row["status"] not in ("sent", "pending"):
             return
@@ -676,8 +694,9 @@ class Forwarder:
             failed = [mid for mid in ids
                       if not await asyncio.to_thread(self.bale.delete_message, mid)]
             if failed:
-                # stays 'sent', so the leftover Bale copies remain visible in the DB
-                logger.warning("Could not delete Bale messages %s (%s post)", failed, status)
+                # stays 'sent'; connectivity_loop retries deleting just the leftover messages
+                self.db.set_pending_action(row["id"], status, attempts + 1, failed)
+                logger.warning("Could not delete Bale messages %s (%s post), will retry", failed, status)
                 return
         _remove_row_media(row)
         self.db.set_status(row["id"], status)
@@ -699,15 +718,41 @@ class Forwarder:
                     if self._give_up_if_expired(row):
                         continue
                     logger.info("Retry attempt #1 for row_id=%s", row["id"])
-                    sent_id = await self._send_pending_row(row)
-                    if sent_id:
-                        self.db.mark_sent(row["id"], sent_id)
-                        logger.info("Post sent to Bale successfully on retry (row_id=%s)", row["id"])
-                    else:
-                        self.db.mark_failed(row["id"], row["retry_count"])
-                        logger.warning("Retry failed for row_id=%s, moved to pending queue", row["id"])
+                    await self._retry_row(row)
             except Exception as e:
                 logger.error("Immediate retry loop error: %s", e)
+
+    async def _retry_row(self, row):
+        """Retry one queued row. An unexpected error counts as a failed attempt instead of
+        aborting the loop, so one bad row can't hold up every row queued behind it."""
+        try:
+            sent_ids = await self._send_pending_row(row)
+        except Exception:
+            logger.exception("Unexpected error retrying row_id=%s", row["id"])
+            sent_ids = []
+        if sent_ids:
+            if await self._record_sent(row["id"], sent_ids):
+                logger.info("Queued post sent to Bale (row_id=%s)", row["id"])
+        elif self.db.mark_failed(row["id"], row["retry_count"]):
+            logger.warning("Retry failed for row_id=%s, keeping in queue", row["id"])
+
+    async def _retry_pending_action(self, row):
+        """Retry a Bale edit/delete that failed earlier; give up after MAX_ACTION_ATTEMPTS."""
+        action, attempts = row["pending_action"], row["retry_count"]
+        if attempts >= MAX_ACTION_ATTEMPTS:
+            self.db.set_pending_action(row["id"], None)
+            logger.error("Giving up on Bale %s for row_id=%s after %d attempts",
+                         action, row["id"], attempts)
+            return
+        if action != "edit":
+            await self._withdraw_post(row["telegram_message_id"], row["channel_id"], action, attempts)
+            return
+        edit = self.bale.edit_message_caption if row["media_type"] else self.bale.edit_message_text
+        if await asyncio.to_thread(edit, row["bale_message_id"], row["caption"]):
+            self.db.set_pending_action(row["id"], None)
+            logger.info("Queued edit applied to Bale message %s", row["bale_message_id"])
+        else:
+            self.db.set_pending_action(row["id"], "edit", attempts + 1)
 
     async def connectivity_loop(self):
         """
@@ -725,19 +770,21 @@ class Forwarder:
                     logger.info("Bale connectivity check: unreachable. Queue preserved.")
                     continue
 
+                # deletes/edits that failed while Bale was down go first: a deleted post must come off fast
+                for row in self.db.get_pending_actions():
+                    try:
+                        await self._retry_pending_action(row)
+                    except Exception:
+                        logger.exception("Unexpected error retrying %s for row_id=%s",
+                                         row["pending_action"], row["id"])
+
                 logger.info("Bale connectivity check: OK. Flushing pending queue...")
                 if not rows:
                     logger.info("No queued messages to flush.")
                     continue
 
                 for row in rows:
-                    sent_id = await self._send_pending_row(row)
-                    if sent_id:
-                        self.db.mark_sent(row["id"], sent_id)
-                        logger.info("Queued post sent to Bale (row_id=%s)", row["id"])
-                    else:
-                        self.db.mark_failed(row["id"], row["retry_count"])
-                        logger.warning("Failed to flush queued post (row_id=%s), keeping in queue", row["id"])
+                    await self._retry_row(row)
             except Exception as e:
                 logger.error("Connectivity loop error: %s", e)
 

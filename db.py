@@ -48,6 +48,7 @@ class Database:
                     created_at              TEXT NOT NULL,
                     grouped_id              INTEGER,
                     bale_message_ids        TEXT,
+                    pending_action          TEXT,
                     UNIQUE(telegram_message_id, channel_id)
                 )
             """)
@@ -68,6 +69,9 @@ class Database:
             if "bale_message_ids" not in existing:
                 conn.execute("ALTER TABLE messages ADD COLUMN bale_message_ids TEXT")
                 logger.info("DB migration: added bale_message_ids column")
+            if "pending_action" not in existing:
+                conn.execute("ALTER TABLE messages ADD COLUMN pending_action TEXT")
+                logger.info("DB migration: added pending_action column")
             conn.commit()
         logger.debug("Database initialized: %s", self.db_path)
 
@@ -101,28 +105,57 @@ class Database:
             return None
 
     def mark_sent(self, row_id: int, bale_message_id: Optional[int] = None,
-                  bale_message_ids: Optional[list[int]] = None):
-        """bale_message_ids: every Bale message of an album (kept if not given)."""
+                  bale_message_ids: Optional[list[int]] = None, only_pending: bool = True) -> bool:
+        """bale_message_ids: every Bale message of an album (kept if not given).
+        only_pending: leave a row withdrawn (deleted/blocked) mid-send alone; returns False then."""
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """UPDATE messages SET status='sent', bale_message_id=?,
-                       bale_message_ids=COALESCE(?, bale_message_ids) WHERE id=?""",
+                       bale_message_ids=COALESCE(?, bale_message_ids) WHERE id=?"""
+                + (" AND status='pending'" if only_pending else ""),
                 (bale_message_id, json.dumps(bale_message_ids) if bale_message_ids else None,
                  row_id),
             )
             conn.commit()
+            return cur.rowcount > 0
 
-    def mark_failed(self, row_id: int, retry_count: int):
+    def mark_failed(self, row_id: int, retry_count: int) -> bool:
         """
-        Increment retry_count and keep status='pending'.
+        Increment retry_count of a pending row. Returns False if the row is no longer pending
+        (withdrawn while its send was in flight), so it is not put back in the queue.
         No timer is set — connectivity loop handles flushing when Bale is reachable.
         """
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE messages SET status='pending', retry_count=? WHERE id=?",
+            cur = conn.execute(
+                "UPDATE messages SET retry_count=? WHERE id=? AND status='pending'",
                 (retry_count + 1, row_id),
             )
             conn.commit()
+            return cur.rowcount > 0
+
+    def set_pending_action(self, row_id: int, action: Optional[str], attempts: int = 0,
+                           bale_message_ids: Optional[list[int]] = None):
+        """Queue a Bale change that failed on a sent row — 'edit' (caption column holds the new
+        text), 'deleted' or 'blocked' — or clear it with None. For sent rows retry_count counts
+        the attempts at this action; bale_message_ids narrows a delete to what is still left."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE messages SET pending_action=?, retry_count=?,
+                       bale_message_ids=COALESCE(?, bale_message_ids) WHERE id=?""",
+                (action, attempts, json.dumps(bale_message_ids) if bale_message_ids else None,
+                 row_id),
+            )
+            conn.commit()
+
+    def get_pending_actions(self) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM messages WHERE pending_action IS NOT NULL ORDER BY created_at",
+            ).fetchall()
+
+    def get_row(self, row_id: int) -> Optional[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM messages WHERE id=?", (row_id,)).fetchone()
 
     def requeue_new(self, row_id: Optional[int] = None) -> int:
         """Hand pending rows whose first send never finished (crash, restart, unexpected error)
@@ -140,7 +173,8 @@ class Database:
         """Move a row to a terminal status: 'failed' (gave up), 'blocked' (blocked word after edit)
         or 'deleted' (post removed in Telegram)."""
         with self._connect() as conn:
-            conn.execute("UPDATE messages SET status=? WHERE id=?", (status, row_id))
+            conn.execute("UPDATE messages SET status=?, pending_action=NULL WHERE id=?",
+                         (status, row_id))
             conn.commit()
 
     def get_immediate_retries(self) -> list[sqlite3.Row]:

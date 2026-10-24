@@ -110,9 +110,10 @@ async def test_album_survives_retry():
     assert all(Path(i["path"]).exists() for i in items)
 
     f.bale = FakeBale(ok=True)
-    assert await f._send_pending_row(row) == 100
+    await f._retry_row(row)
     assert not any(Path(i["path"]).exists() for i in items)
-    assert json.loads(db.get_row_by_telegram_id(1, "-1")["bale_message_ids"]) == [100, 102]
+    row = db.get_row_by_telegram_id(1, "-1")
+    assert row["status"] == "sent" and json.loads(row["bale_message_ids"]) == [100, 102]
 
 
 async def test_give_up():
@@ -166,6 +167,78 @@ def test_bold_link_markdown():
     from telethon.tl.types import MessageEntityBold, MessageEntityTextUrl
     ents = [MessageEntityBold(0, 5), MessageEntityTextUrl(0, 5, "http://x")]
     assert fw._entities_to_markdown("hello world", ents) == "*[hello](http://x)* world"
+
+
+async def test_bad_row_does_not_block_queue():
+    class Boom(FakeBale):
+        def send_text(self, text, reply_to=None):
+            if text == "bad":
+                raise ValueError("unexpected")
+            return 101
+    f, db = make(Boom(ok=True))
+    for tg_id, cap in ((60, "bad"), (61, "good")):
+        db.mark_failed(db.insert_message(tg_id, "-1", cap, None, None), 1)
+    for row in db.get_queued_pending():
+        await f._retry_row(row)
+    assert db.get_row_by_telegram_id(60, "-1")["retry_count"] == 3  # counted as a failed try
+    assert db.get_row_by_telegram_id(61, "-1")["status"] == "sent"
+
+
+def test_partial_album_rolled_back():
+    calls = []
+
+    def handler(req):
+        method = req.url.path.rsplit("/", 1)[-1]
+        calls.append(method)
+        if method == "sendMediaGroup":
+            return httpx.Response(400, json={"ok": False, "description": "UNSUPPORTED"})
+        if method == "sendPhoto" and calls.count("sendPhoto") > 1:
+            return httpx.Response(500, json={"ok": False})
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 9}})
+
+    c = BaleClient("TOKEN", "123")
+    c._client = httpx.Client(transport=httpx.MockTransport(handler))
+    for n in ("a.jpg", "b.jpg"):
+        Path(n).write_bytes(b"x")
+    photos = [{"type": "photo", "path": "a.jpg"}, {"type": "photo", "path": "b.jpg"}]
+    assert c.send_media_group(photos, "cap") == []  # second photo failed
+    assert calls[-1] == "deleteMessage"  # the first one was taken back down
+
+
+async def test_failed_delete_and_edit_retried():
+    bale = FakeBale(ok=True)
+    bale.delete_message = lambda mid: mid != 901  # 901 can't be deleted while Bale is down
+    f, db = make(bale)
+    row_id = db.insert_message(50, "-1", "cap", None, "album")
+    db.mark_sent(row_id, 900, [900, 901])
+    await f._withdraw_post(50, "-1", "deleted")
+    row = db.get_row_by_telegram_id(50, "-1")
+    assert row["status"] == "sent" and row["pending_action"] == "deleted"
+    assert json.loads(row["bale_message_ids"]) == [901]  # only the leftover is retried
+
+    bale.delete_message = lambda mid: True
+    await f._retry_pending_action(row)
+    row = db.get_row_by_telegram_id(50, "-1")
+    assert row["status"] == "deleted" and row["pending_action"] is None
+
+    edit_id = db.insert_message(51, "-1", "new caption", None, None)
+    db.mark_sent(edit_id, 910)
+    db.set_pending_action(edit_id, "edit")
+    edited = []
+    bale.edit_message_text = lambda mid, text: edited.append((mid, text)) or True
+    await f._retry_pending_action(db.get_row(edit_id))
+    assert edited == [(910, "new caption")] and db.get_row(edit_id)["pending_action"] is None
+
+
+async def test_withdrawn_during_send():
+    bale = FakeBale(ok=True)
+    f, db = make(bale)
+    row_id = db.insert_message(70, "-1", "cap", None, None)
+    await f._withdraw_post(70, "-1", "deleted")  # deleted in Telegram while the send is in flight
+    assert not await f._record_sent(row_id, [990])  # send finishes afterwards
+    assert bale.deleted == [990] and db.get_row(row_id)["status"] == "deleted"
+    assert not db.mark_failed(row_id, 0)  # a failed send can't revive it either
+    assert db.get_row(row_id)["status"] == "deleted"
 
 
 def test_400_drops_markdown_then_reply():
@@ -294,8 +367,10 @@ if __name__ == "__main__":
     test_migration_adds_columns()
     test_bold_link_markdown()
     test_400_drops_markdown_then_reply()
+    test_partial_album_rolled_back()
     for t in (test_album_survives_retry, test_give_up, test_blocked_album, test_blocked_edit,
               test_source_delete, test_album_edit, test_expire_during_outage,
-              test_interrupted_send_requeued):
+              test_interrupted_send_requeued, test_bad_row_does_not_block_queue,
+              test_failed_delete_and_edit_retried, test_withdrawn_during_send):
         asyncio.run(t())
     print("all checks passed")
